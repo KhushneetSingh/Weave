@@ -1,4 +1,4 @@
-version: "3.9"
+
 
 services:
   db:
@@ -16,7 +16,7 @@ services:
       timeout: 5s
       retries: 5
     ports:
-      - "5432:5432"
+      - "5433:5432"
 
   redis:
     image: redis:7-alpine
@@ -56,7 +56,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    command: celery -A app.worker worker --loglevel=${LOG_LEVEL:-info}
+    command: celery -A app.worker:celery_app worker --loglevel=${LOG_LEVEL:-info}
     env_file:
       - .env
     environment:
@@ -74,17 +74,7 @@ services:
   log_ui:
     image: python:3.11-slim
     restart: unless-stopped
-    command: >
-      python -c "
-      from http.server import HTTPServer, BaseHTTPRequestHandler;
-      class H(BaseHTTPRequestHandler):
-          def do_GET(self):
-              self.send_response(200);
-              self.end_headers();
-              self.wfile.write(b'log_ui placeholder - coming soon');
-          def log_message(self, *args): pass
-      HTTPServer(('0.0.0.0', 8080), H).serve_forever()
-      "
+    command: python -m http.server 8080
     ports:
       - "8080:8080"
 

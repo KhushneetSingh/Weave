@@ -1,1 +1,1 @@
-"""mega-ai application package."""
+"""Weave application package."""

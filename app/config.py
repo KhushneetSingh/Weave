@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # ── Postgres ──────────────────────────────────────────────────────────────
-    postgres_user: str = "megaai"
-    postgres_password: str = "megaai"
-    postgres_db: str = "megaai"
+    postgres_user: str = "weave"
+    postgres_password: str = "weave"
+    postgres_db: str = "weave"
     postgres_host: str = "db"
     postgres_port: int = 5432
 

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="mega-ai",
+    title="Weave",
     description="Multi-agent LLM orchestration system — Phase 1 scaffold",
     version="0.1.0",
     docs_url="/docs",
