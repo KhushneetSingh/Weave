@@ -34,3 +34,5 @@ htmlcov/
 
 # Alembic generated migrations (commit intentionally)
 # alembic/versions/*.py
+
+guide.md

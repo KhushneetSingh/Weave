@@ -29,7 +29,11 @@ class Job(Base):
     )
     query: Mapped[str] = mapped_column(String(2048), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
-        Enum(JobStatus, name="job_status"),
+        Enum(
+            JobStatus,
+            name="job_status",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
         nullable=False,
         default=JobStatus.PENDING,
     )
