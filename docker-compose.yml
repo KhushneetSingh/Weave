@@ -72,11 +72,23 @@ services:
     working_dir: /app
 
   log_ui:
-    image: python:3.11-slim
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
-    command: python -m http.server 8080
+    command: uvicorn log_ui.main:app --host 0.0.0.0 --port 8080 --reload
     ports:
       - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
 
 volumes:
   postgres_data:

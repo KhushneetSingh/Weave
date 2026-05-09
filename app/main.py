@@ -4,9 +4,9 @@ import logging
 import time
 import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.config import settings
@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Weave",
-    description="Multi-agent LLM orchestration system — Phase 2",
-    version="0.2.0",
+    description="Multi-agent LLM orchestration system with self-improving eval loop",
+    version="0.4.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -36,13 +36,84 @@ app.add_middleware(
 )
 
 
-# ── Request schema ────────────────────────────────────────────────────────────
+# ── Standardised error response ──────────────────────────────────────────────
+
+class WeaveError(Exception):
+    """Application-level error with a structured error_code."""
+
+    def __init__(
+        self,
+        error_code: str,
+        message: str,
+        status_code: int = 400,
+        job_id: str | None = None,
+    ) -> None:
+        self.error_code = error_code
+        self.message = message
+        self.status_code = status_code
+        self.job_id = job_id
+        super().__init__(message)
+
+
+@app.exception_handler(WeaveError)
+async def weave_error_handler(_request: Request, exc: WeaveError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": exc.error_code,
+            "message": exc.message,
+            "job_id": exc.job_id,
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": "HTTP_ERROR",
+            "message": str(exc.detail),
+            "job_id": None,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_code": "INTERNAL_ERROR",
+            "message": "An unexpected error occurred.",
+            "job_id": None,
+        },
+    )
+
+
+# ── Request schemas ───────────────────────────────────────────────────────────
+
 class QueryRequest(BaseModel):
     query: str
     max_budget: int = 4000
 
 
+class EvalRunRequest(BaseModel):
+    case_ids: list[str] | None = None
+
+
+class PromptReviewRequest(BaseModel):
+    decision: str  # "approve" | "reject"
+    reviewer_note: str = ""
+
+
+class ReRunFailedRequest(BaseModel):
+    use_approved_prompts: bool = True
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
+
 @app.get("/health", tags=["meta"])
 async def health() -> dict:
     """Liveness probe — returns 200 when the API process is running."""
@@ -50,12 +121,14 @@ async def health() -> dict:
 
 
 # ── SSE helper ────────────────────────────────────────────────────────────────
+
 def _sse_event(data: dict) -> str:
     """Format a dict as an SSE data line."""
     return f"data: {json.dumps(data, default=str)}\n\n"
 
 
 # ── POST /query  ──────────────────────────────────────────────────────────────
+
 @app.post("/query", tags=["orchestration"])
 async def query_endpoint(body: QueryRequest):
     """
@@ -143,62 +216,200 @@ async def query_endpoint(body: QueryRequest):
     )
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── GET /jobs/{job_id}/trace ─────────────────────────────────────────────────
 
-async def _run_pipeline(query, job_id, max_budget, event_queue):
-    """Run the orchestrator pipeline — called as a background task."""
-    from app.core.orchestrator import run_pipeline
-    return await run_pipeline(
-        query=query,
-        job_id=job_id,
-        max_budget=max_budget,
-        event_queue=event_queue,
-    )
+@app.get("/jobs/{job_id}/trace", tags=["orchestration"])
+async def job_trace(job_id: str):
+    """
+    Reconstruct an ordered trace of all events (AgentLog + ToolLog)
+    for a given job.
+    """
+    from sqlalchemy import select
+
+    from app.database import AsyncSessionLocal
+    from app.models.agent_log import AgentLog
+    from app.models.job import Job
+    from app.models.tool_log import ToolLog
+
+    async with AsyncSessionLocal() as session:
+        # Fetch job
+        result = await session.execute(
+            select(Job).where(Job.id == uuid.UUID(job_id))
+        )
+        job = result.scalar_one_or_none()
+
+    if not job:
+        raise WeaveError(
+            error_code="JOB_NOT_FOUND",
+            message="No job with that ID",
+            status_code=404,
+            job_id=job_id,
+        )
+
+    async with AsyncSessionLocal() as session:
+        # Fetch agent logs
+        agent_result = await session.execute(
+            select(AgentLog)
+            .where(AgentLog.job_id == uuid.UUID(job_id))
+            .order_by(AgentLog.timestamp)
+        )
+        agent_logs = agent_result.scalars().all()
+
+        # Fetch tool logs
+        tool_result = await session.execute(
+            select(ToolLog)
+            .where(ToolLog.job_id == uuid.UUID(job_id))
+            .order_by(ToolLog.timestamp)
+        )
+        tool_logs = tool_result.scalars().all()
+
+    # Merge and sort by timestamp
+    events: list[dict] = []
+
+    for al in agent_logs:
+        events.append({
+            "timestamp": al.timestamp.isoformat() if al.timestamp else None,
+            "event_type": al.event_type,
+            "agent_id": al.agent_id,
+            "details": {
+                "latency_ms": al.latency_ms,
+                "token_count": al.token_count,
+                "policy_violation": al.policy_violation,
+                "payload": al.payload,
+            },
+        })
+
+    for tl in tool_logs:
+        events.append({
+            "timestamp": tl.timestamp.isoformat() if tl.timestamp else None,
+            "event_type": f"tool_call:{tl.tool_name}",
+            "agent_id": tl.agent_id,
+            "details": {
+                "tool_name": tl.tool_name,
+                "status": tl.status,
+                "latency_ms": tl.latency_ms,
+                "retry_count": tl.retry_count,
+                "accepted": tl.accepted,
+                "input": tl.input,
+                "output": tl.output,
+            },
+        })
+
+    # Sort all events by timestamp
+    events.sort(key=lambda e: e["timestamp"] or "")
+
+    return {
+        "job_id": str(job.id),
+        "query": job.query,
+        "status": job.status.value if hasattr(job.status, "value") else str(job.status),
+        "total_latency_ms": float(job.total_latency_ms),
+        "total_tokens": job.total_tokens,
+        "events": events,
+    }
 
 
-async def _update_job_status(
-    job_id: str, status: str, total_tokens: int, total_latency_ms: int
-) -> None:
-    """Update job row in Postgres."""
-    try:
-        from datetime import datetime, timezone
+# ── GET /eval/latest ─────────────────────────────────────────────────────────
 
-        from sqlalchemy import update
+@app.get("/eval/latest", tags=["eval"])
+async def eval_latest():
+    """Return the latest eval run summary grouped by category + dimension."""
+    from sqlalchemy import desc, select
 
-        from app.database import AsyncSessionLocal
-        from app.models.job import Job, JobStatus
+    from app.database import AsyncSessionLocal
+    from app.models.eval_run import EvalRun
 
-        status_enum = JobStatus(status)
-        async with AsyncSessionLocal() as session:
-            stmt = (
-                update(Job)
-                .where(Job.id == job_id)
-                .values(
-                    status=status_enum,
-                    total_tokens=total_tokens,
-                    total_latency_ms=total_latency_ms,
-                    completed_at=datetime.now(timezone.utc),
-                )
-            )
-            await session.execute(stmt)
-            await session.commit()
-    except Exception as exc:
-        logger.error("Failed to update job status: %s", exc)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(EvalRun).order_by(desc(EvalRun.timestamp)).limit(2)
+        )
+        runs = result.scalars().all()
 
+    if not runs or not runs[0].scores:
+        raise WeaveError(
+            error_code="EVAL_NOT_FOUND",
+            message="No eval runs found.",
+            status_code=404,
+        )
 
-# ── Eval / Meta-agent request schemas ─────────────────────────────────────────
+    latest = runs[0]
+    previous = runs[1] if len(runs) > 1 else None
 
-class EvalRunRequest(BaseModel):
-    case_ids: list[str] | None = None
+    dimensions = [
+        "answer_correctness", "citation_accuracy",
+        "contradiction_resolution", "tool_efficiency",
+        "budget_compliance", "critique_agreement",
+    ]
 
+    # ── by_category ──────────────────────────────────────────────────
+    by_type: dict[str, list[dict]] = {}
+    for entry in latest.scores:
+        ct = entry.get("case_type", "unknown")
+        by_type.setdefault(ct, []).append(entry)
 
-class PromptReviewRequest(BaseModel):
-    decision: str  # "approve" | "reject"
-    reviewer_note: str = ""
+    by_category: dict = {}
+    for case_type, entries in by_type.items():
+        type_scores = [_compute_total(e) for e in entries]
+        avg_score = round(sum(type_scores) / len(type_scores), 3) if type_scores else 0.0
 
+        cases = []
+        for e in entries:
+            dim_map = {}
+            for dim in dimensions:
+                dim_data = e.get(dim, {})
+                dim_map[dim] = dim_data.get("score", 0.0) if isinstance(dim_data, dict) else 0.0
+            cases.append({
+                "id": e.get("case_id", ""),
+                "total_score": round(_compute_total(e), 3),
+                "dimensions": dim_map,
+            })
+        by_category[case_type] = {"avg_score": avg_score, "cases": cases}
 
-class ReRunFailedRequest(BaseModel):
-    use_approved_prompts: bool = True
+    # ── by_dimension ─────────────────────────────────────────────────
+    by_dimension: dict = {}
+    for dim in dimensions:
+        dim_scores = []
+        for entry in latest.scores:
+            dim_data = entry.get(dim, {})
+            score = dim_data.get("score", 0.0) if isinstance(dim_data, dict) else 0.0
+            dim_scores.append(score)
+        by_dimension[dim] = {
+            "avg": round(sum(dim_scores) / len(dim_scores), 3) if dim_scores else 0.0,
+            "min": round(min(dim_scores), 3) if dim_scores else 0.0,
+            "max": round(max(dim_scores), 3) if dim_scores else 0.0,
+        }
+
+    # ── delta_vs_previous ────────────────────────────────────────────
+    delta_vs_previous = None
+    if previous and previous.scores:
+        # Overall delta
+        current_total = sum(_compute_total(e) for e in latest.scores) / len(latest.scores)
+        prev_total = sum(_compute_total(e) for e in previous.scores) / len(previous.scores)
+        overall_delta = round(current_total - prev_total, 3)
+
+        dim_delta: dict = {}
+        for dim in dimensions:
+            cur_vals = [
+                e.get(dim, {}).get("score", 0.0) if isinstance(e.get(dim, {}), dict) else 0.0
+                for e in latest.scores
+            ]
+            prev_vals = [
+                e.get(dim, {}).get("score", 0.0) if isinstance(e.get(dim, {}), dict) else 0.0
+                for e in previous.scores
+            ]
+            cur_avg = sum(cur_vals) / len(cur_vals) if cur_vals else 0.0
+            prev_avg = sum(prev_vals) / len(prev_vals) if prev_vals else 0.0
+            dim_delta[dim] = round(cur_avg - prev_avg, 3)
+
+        delta_vs_previous = {"overall": overall_delta, "by_dimension": dim_delta}
+
+    return {
+        "run_id": str(latest.id),
+        "timestamp": latest.timestamp.isoformat() if latest.timestamp else None,
+        "total_cases": len(latest.scores),
+        "by_category": by_category,
+        "by_dimension": by_dimension,
+        "delta_vs_previous": delta_vs_previous,
+    }
 
 
 # ── POST /eval/run ────────────────────────────────────────────────────────────
@@ -224,17 +435,6 @@ async def eval_run(body: EvalRunRequest = EvalRunRequest()):
         "status": "started",
         "case_count": case_count,
     }
-
-
-# ── GET /eval/latest ──────────────────────────────────────────────────────────
-
-@app.get("/eval/latest", tags=["eval"])
-async def eval_latest():
-    """Return the latest eval run summary grouped by category + dimension."""
-    from app.eval.harness import EvalHarness
-
-    harness = EvalHarness()
-    return await harness.get_latest_summary()
 
 
 # ── POST /prompt-rewrites/{rewrite_id}/review ─────────────────────────────────
@@ -265,7 +465,28 @@ async def review_prompt_rewrite(rewrite_id: str, body: PromptReviewRequest):
         rewrite = result.scalar_one_or_none()
 
     if not rewrite:
-        return {"error": f"Rewrite {rewrite_id} not found."}, 404
+        raise WeaveError(
+            error_code="REWRITE_NOT_FOUND",
+            message=f"Prompt rewrite {rewrite_id} not found.",
+            status_code=404,
+            job_id=None,
+        )
+
+    if rewrite.status != "pending":
+        raise WeaveError(
+            error_code="REWRITE_ALREADY_REVIEWED",
+            message=f"Prompt rewrite {rewrite_id} has already been {rewrite.status}.",
+            status_code=409,
+            job_id=None,
+        )
+
+    if body.decision not in ("approve", "reject"):
+        raise WeaveError(
+            error_code="INVALID_INPUT",
+            message="Decision must be 'approve' or 'reject'.",
+            status_code=422,
+            job_id=None,
+        )
 
     now = datetime.now(timezone.utc)
     re_eval_triggered = False
@@ -291,7 +512,6 @@ async def review_prompt_rewrite(rewrite_id: str, body: PromptReviewRequest):
         # 3. Trigger re-eval on failed cases
         from app.worker.tasks import run_eval_task
 
-        # Find the eval run associated with this rewrite to get failed cases
         run_eval_task.delay(run_type="full")
         re_eval_triggered = True
 
@@ -345,7 +565,11 @@ async def eval_rerun_failed(body: ReRunFailedRequest = ReRunFailedRequest()):
         latest = result.scalar_one_or_none()
 
     if not latest:
-        return {"error": "No previous eval runs found."}
+        raise WeaveError(
+            error_code="EVAL_NOT_FOUND",
+            message="No previous eval runs found.",
+            status_code=404,
+        )
 
     # If use_approved_prompts, apply any approved rewrites first
     if body.use_approved_prompts:
@@ -375,7 +599,63 @@ async def eval_rerun_failed(body: ReRunFailedRequest = ReRunFailedRequest()):
     }
 
 
-# ── Helpers for prompt patching ───────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+async def _run_pipeline(query, job_id, max_budget, event_queue):
+    """Run the orchestrator pipeline — called as a background task."""
+    from app.core.orchestrator import run_pipeline
+    return await run_pipeline(
+        query=query,
+        job_id=job_id,
+        max_budget=max_budget,
+        event_queue=event_queue,
+    )
+
+
+async def _update_job_status(
+    job_id: str, status: str, total_tokens: int, total_latency_ms: int
+) -> None:
+    """Update job row in Postgres."""
+    try:
+        from datetime import datetime, timezone
+
+        from sqlalchemy import update
+
+        from app.database import AsyncSessionLocal
+        from app.models.job import Job, JobStatus
+
+        status_enum = JobStatus(status)
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                update(Job)
+                .where(Job.id == job_id)
+                .values(
+                    status=status_enum,
+                    total_tokens=total_tokens,
+                    total_latency_ms=total_latency_ms,
+                    completed_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+    except Exception as exc:
+        logger.error("Failed to update job status: %s", exc)
+
+
+def _compute_total(score_entry: dict) -> float:
+    """Compute unweighted mean of all 6 dimensions from a dict."""
+    dims = [
+        "answer_correctness", "citation_accuracy",
+        "contradiction_resolution", "tool_efficiency",
+        "budget_compliance", "critique_agreement",
+    ]
+    values = []
+    for d in dims:
+        dim_data = score_entry.get(d, {})
+        score = dim_data.get("score", 0.0) if isinstance(dim_data, dict) else 0.0
+        values.append(score)
+    return sum(values) / len(values) if values else 0.0
+
 
 def _patch_agent_prompt(agent_id: str, new_prompt: str) -> None:
     """Patch an agent's system_prompt in memory (class-level attribute)."""
