@@ -253,3 +253,7 @@ Weave/
 ├── .env.example
 └── .gitignore
 ```
+
+---
+
+*Built with AI assistance. See [AI_COLLABORATION.md](./AI_COLLABORATION.md) for full attestation.*
